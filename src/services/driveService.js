@@ -1,18 +1,37 @@
 const { google } = require('googleapis');
 const path = require('path');
 
-const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE;
+const jsonEnv = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const subject = process.env.GOOGLE_SERVICE_ACCOUNT_SUBJECT;
 
-if (!keyFile) {
-  throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_KEY_FILE environment variable.');
-}
-
-const auth = new google.auth.GoogleAuth({
-  keyFile: path.isAbsolute(keyFile) ? keyFile : path.resolve(process.cwd(), keyFile),
+const authOptions = {
   scopes: ['https://www.googleapis.com/auth/drive'],
   subject: subject || undefined,
-});
+};
+
+if (!jsonEnv) {
+  throw new Error('Missing GOOGLE_SERVICE_ACCOUNT_JSON environment variable.');
+}
+
+let creds;
+try {
+  creds = typeof jsonEnv === 'string' ? JSON.parse(jsonEnv) : jsonEnv;
+} catch (err) {
+  throw new Error('Invalid JSON in GOOGLE_SERVICE_ACCOUNT_JSON environment variable.');
+}
+
+if (!creds.client_email || !creds.private_key) {
+  throw new Error('GOOGLE_SERVICE_ACCOUNT_JSON must include client_email and private_key.');
+}
+
+authOptions.credentials = {
+  client_email: creds.client_email,
+  private_key: creds.private_key,
+};
+
+if (creds.project_id) authOptions.projectId = creds.project_id;
+
+const auth = new google.auth.GoogleAuth(authOptions);
 
 async function getDriveClient() {
   const client = await auth.getClient();
