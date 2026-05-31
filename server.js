@@ -9,7 +9,7 @@ const driveRouter = require('./src/routes/drive');
 const app = express();
 app.use(express.json());
 
-app.use('/api', driveRouter);
+app.use('/api/drive', driveRouter);
 
 app.get('/', (req, res) => {
   res.send({ status: 'ok', message: 'Simba Drives Backend is running.' });
