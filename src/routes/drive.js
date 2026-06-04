@@ -1,6 +1,6 @@
 const express = require('express');
 const multer = require('multer');
-const { grantDrivePermission, checkUserAccess, listFilesRecursively, buildHierarchicalStructure, uploadFile, downloadFile, createFolder } = require('../services/driveService');
+const { grantDrivePermission, checkUserAccess, listFolderChildren, searchFilesInFolder, buildHierarchicalStructure, uploadFile, downloadFile, createFolder } = require('../services/driveService');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
@@ -83,7 +83,7 @@ router.post('/create-folder', async (req, res) => {
 });
 
 router.get('/list-files', async (req, res) => {
-  const { folderId } = req.query;
+  const { folderId, recursive = 'false', pageSize, pageToken, maxItems } = req.query;
 
   console.info('list-files request received:', { folderId });
 
@@ -92,15 +92,55 @@ router.get('/list-files', async (req, res) => {
     return res.status(400).json({ error: 'Missing required field: folderId.' });
   }
 
-  try {
-    const files = await buildHierarchicalStructure(folderId);
+  const recursiveListing = String(recursive).toLowerCase() === 'true';
+  const parsedPageSize = Math.min(Math.max(parseInt(pageSize, 10) || 100, 10), 1000);
+  const parsedMaxItems = Math.min(Math.max(parseInt(maxItems, 10) || 5000, 1), 10000);
 
-    console.info('list-files succeeded:', { folderId, fileCount: files.length });
-    res.status(200).json({ success: true, fileCount: files.length, files });
+  try {
+    if (recursiveListing) {
+      const files = await buildHierarchicalStructure(folderId, parsedMaxItems);
+
+      console.info('list-files succeeded (recursive):', { folderId, fileCount: files.length, maxItems: parsedMaxItems });
+      return res.status(200).json({ success: true, fileCount: files.length, maxItems: parsedMaxItems, files });
+    }
+
+    const { files, nextPageToken } = await listFolderChildren({ folderId, pageSize: parsedPageSize, pageToken });
+
+    console.info('list-files succeeded:', { folderId, fileCount: files.length, nextPageToken: !!nextPageToken });
+    return res.status(200).json({ success: true, fileCount: files.length, nextPageToken, files });
   } catch (error) {
     console.error('list-files error:', error.message || error);
     const status = error.code === 403 ? 403 : 500;
     res.status(status).json({ success: false, error: error.message || 'Unable to list files.' });
+  }
+});
+
+router.get('/search-files', async (req, res) => {
+  const { folderId, searchTerm, pageSize, pageToken } = req.query;
+
+  console.info('search-files request received:', { folderId, searchTerm });
+
+  if (!folderId || !searchTerm) {
+    console.warn('search-files missing folderId or searchTerm');
+    return res.status(400).json({ error: 'Missing required fields: folderId and searchTerm.' });
+  }
+
+  const parsedPageSize = Math.min(Math.max(parseInt(pageSize, 10) || 50, 10), 500);
+
+  try {
+    const { results, nextPageToken } = await searchFilesInFolder({
+      folderId,
+      searchTerm,
+      pageSize: parsedPageSize,
+      pageToken,
+    });
+
+    console.info('search-files succeeded:', { folderId, searchTerm, itemCount: results.length, nextPageToken: !!nextPageToken });
+    return res.status(200).json({ success: true, itemCount: results.length, nextPageToken, results });
+  } catch (error) {
+    console.error('search-files error:', error.message || error);
+    const status = error.code === 403 ? 403 : 500;
+    res.status(status).json({ success: false, error: error.message || 'Unable to search files.' });
   }
 });
 
