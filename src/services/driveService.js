@@ -164,94 +164,99 @@ function decodeSearchToken(token) {
 }
 
 async function searchFilesInFolder({ folderId, searchTerm, pageSize = 50, pageToken = null }) {
-  if (!folderId) {
-    throw new Error('Missing folderId.');
-  }
-  if (!searchTerm || !searchTerm.trim()) {
-    throw new Error('Missing searchTerm.');
-  }
+  if (!folderId) throw new Error('Missing folderId.');
+  if (!searchTerm || !searchTerm.trim()) throw new Error('Missing searchTerm.');
 
   const drive = await getDriveClient();
   const folderMimeType = 'application/vnd.google-apps.folder';
-  const cleanSearchTerm = String(searchTerm).trim().replace(/'/g, "\\'")
-  const MAX_CONCURRENT_REQUESTS = 5;
-  const MAX_DEPTH = 8;
-  const REQUEST_TIMEOUT = 8000;
+  const cleanSearchTerm = String(searchTerm).trim().replace(/'/g, "\\'");
 
-  const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('Search timeout')), REQUEST_TIMEOUT)
-  );
+  // Tunables
+  const REQUEST_TIMEOUT = 3000; // aim for <3s
+  const CANDIDATE_BATCH_SIZE = Math.min(Math.max(pageSize * 3, 50), 200); // fetch more candidates from Drive search
+  const ANCESTOR_CHECK_BATCH = 10; // concurrency for ancestor checks
+
+  const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Search timeout')), REQUEST_TIMEOUT));
 
   const results = [];
   let nextPageToken = null;
 
-  try {
-    // Build folder hierarchy using parallel requests
-    const folderHierarchy = new Set([folderId]);
-    const visitedFolders = new Set([folderId]);
-    let queue = [{ id: folderId, depth: 0 }];
+  // helper: check if candidate is descendant of folderId by walking parents, with simple cache
+  async function isDescendant(candidateId, ancestorId, driveClient, parentCache) {
+    const stack = [candidateId];
+    const seen = new Set();
 
-    while (queue.length > 0) {
-      const batch = queue.splice(0, MAX_CONCURRENT_REQUESTS);
-      const batchPromises = batch.map(async (item) => {
+    while (stack.length) {
+      const id = stack.pop();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      if (id === ancestorId) return true;
+
+      let parents = parentCache.get(id);
+      if (parents === undefined) {
         try {
-          const { files } = await Promise.race([
-            listFolderChildren({ folderId: item.id, pageSize: 500 }),
-            timeoutPromise,
-          ]);
-
-          const subfolders = [];
-          for (const file of files) {
-            if (file.mimeType === folderMimeType && !visitedFolders.has(file.id) && item.depth < MAX_DEPTH) {
-              folderHierarchy.add(file.id);
-              visitedFolders.add(file.id);
-              subfolders.push({ id: file.id, depth: item.depth + 1 });
-            }
-          }
-          return subfolders;
+          const meta = await driveClient.files.get({ fileId: id, fields: 'parents', supportsAllDrives: true });
+          parents = meta.data.parents || [];
         } catch (err) {
-          console.warn('Folder traversal error:', err.message);
-          return [];
+          parents = [];
         }
-      });
+        parentCache.set(id, parents);
+      }
 
-      const batchResults = await Promise.all(batchPromises);
-      queue = queue.concat(batchResults.flat());
+      for (const p of parents) {
+        if (!seen.has(p)) stack.push(p);
+      }
     }
-
-    // Search using fullText across the folder hierarchy
-    const folderIds = Array.from(folderHierarchy);
-    const folderQuery = folderIds.map((id) => `'${id}' in parents`).join(' or ');
-    const searchQuery = `(name contains '${cleanSearchTerm}' or fullText contains '${cleanSearchTerm}') and (${folderQuery}) and trashed=false`;
-
-    const searchResponse = await Promise.race([
-      drive.files.list({
-        q: searchQuery,
-        spaces: 'drive',
-        fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, size)',
-        pageSize: pageSize * 2,
-        supportsAllDrives: true,
-      }),
-      timeoutPromise,
-    ]);
-
-    const searchResults = searchResponse.data.files || [];
-    results.push(...searchResults.slice(0, pageSize));
-
-    if (searchResponse.data.nextPageToken) {
-      nextPageToken = encodeSearchToken({ folderHierarchy: folderIds, nextPageToken: searchResponse.data.nextPageToken });
-    }
-  } catch (err) {
-    if (err.message !== 'Search timeout') {
-      throw err;
-    }
-    console.warn('Search timeout - returning partial results');
+    return false;
   }
 
-  return {
-    results,
-    nextPageToken,
-  };
+  // Drive-level search across entire drive for term, then locally filter by ancestry
+  let drivePageToken = null;
+  const parentCache = new Map();
+
+  try {
+    do {
+      const searchReq = drive.files.list({
+        q: `(name contains '${cleanSearchTerm}' or fullText contains '${cleanSearchTerm}') and trashed=false`,
+        spaces: 'drive',
+        fields: 'nextPageToken, files(id, name, mimeType, parents, modifiedTime, size)',
+        pageSize: CANDIDATE_BATCH_SIZE,
+        pageToken: drivePageToken || undefined,
+        supportsAllDrives: true,
+      });
+
+      const searchResponse = await Promise.race([searchReq, timeoutPromise]);
+      const candidates = searchResponse.data.files || [];
+
+      // process candidates in small concurrent batches to check ancestry
+      for (let i = 0; i < candidates.length && results.length < pageSize; i += ANCESTOR_CHECK_BATCH) {
+        const batch = candidates.slice(i, i + ANCESTOR_CHECK_BATCH);
+        const checks = batch.map((c) => isDescendant(c.id, folderId, drive, parentCache).then((isDesc) => ({ isDesc, c })));
+        const resolved = await Promise.all(checks);
+        for (const r of resolved) {
+          if (r.isDesc && results.length < pageSize) {
+            results.push(r.c);
+          }
+        }
+      }
+
+      drivePageToken = searchResponse.data.nextPageToken || null;
+
+      if (results.length >= pageSize) {
+        // encode remaining drivePageToken so client can continue
+        if (drivePageToken) nextPageToken = encodeSearchToken({ drivePageToken });
+        break;
+      }
+    } while (drivePageToken);
+  } catch (err) {
+    if (err.message === 'Search timeout') {
+      console.warn('Search timed out; returning partial results');
+    } else {
+      throw err;
+    }
+  }
+
+  return { results, nextPageToken };
 }
 
 async function listFilesRecursively({ folderId, pageToken = null, allItems = [] }) {

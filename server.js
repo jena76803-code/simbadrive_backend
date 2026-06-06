@@ -15,6 +15,10 @@ app.get('/', (req, res) => {
   res.send({ status: 'ok', message: 'Simba Drives Backend is running.' });
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy' });
+});
+
 const port = process.env.PORT || 4000;
 app.listen(port, () => {
   console.log(`Server listening on http://localhost:${port}`);
